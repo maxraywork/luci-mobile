@@ -4,6 +4,7 @@ import 'package:luci_mobile/screens/clients_screen.dart';
 import 'package:luci_mobile/screens/interfaces_screen.dart';
 import 'package:luci_mobile/screens/more_screen.dart';
 import 'package:luci_mobile/main.dart';
+import 'package:luci_mobile/screens/services_screen.dart';
 import 'package:luci_mobile/widgets/luci_navigation_enhancements.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -61,6 +62,7 @@ class _MainScreenState extends ConsumerState<MainScreen> {
       scrollToInterface: _currentInterfaceToScroll,
       onScrollComplete: _clearInterfaceToScroll,
     ),
+    const ServicesScreen(),
     const MoreScreen(),
   ];
 
@@ -150,6 +152,17 @@ class _MainScreenState extends ConsumerState<MainScreen> {
                   child: Icon(Icons.lan_outlined, color: getTabColor(2)),
                 ),
                 label: 'Interfaces',
+              ),
+              NavigationDestination(
+                selectedIcon: Opacity(
+                  opacity: getTabOpacity(2),
+                  child: Icon(Icons.apps, color: getTabColor(2)),
+                ),
+                icon: Opacity(
+                  opacity: getTabOpacity(2),
+                  child: Icon(Icons.apps, color: getTabColor(2)),
+                ),
+                label: 'Services',
               ),
               NavigationDestination(
                 selectedIcon: Opacity(

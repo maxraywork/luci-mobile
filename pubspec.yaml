@@ -40,6 +40,7 @@ dependencies:
   flutter_secure_storage: ^9.2.4
   package_info_plus: ^8.3.0
   url_launcher: ^6.3.0
+  flutter_svg: ^2.2.0
 
 dev_dependencies:
   flutter_test:
@@ -66,3 +67,4 @@ flutter:
   # Include mock data files for reviewer mode
   assets:
     - assets/mock/
+    - assets/icons/
