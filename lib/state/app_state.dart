@@ -1,7 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:convert';
 
+import 'package:dartssh2/dartssh2.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:dio/dio.dart';
 import 'package:dio/io.dart';
@@ -1263,6 +1266,84 @@ class AppState extends ChangeNotifier {
       });
       return macs;
     }
+  }
+
+  Future<Map<String, dynamic>> fetchPodkopConfig() async {
+    if (_routerService?.selectedRouter == null || _authService?.sysauth == null) {
+      return {};
+    }
+
+    final ip = _routerService!.selectedRouter!.ipAddress;
+    final useHttps = _routerService!.selectedRouter!.useHttps;
+
+    final podkopConfig = await _apiService!.call(
+      ip,
+      _authService!.sysauth!,
+      useHttps,
+      object: 'uci',
+      method: 'get',
+      params: {'config': 'podkop'},
+    );
+    dynamic getData(dynamic result) {
+      if (result is List && result.length > 1) {
+        if (result[0] == 0) {
+          return result[1]['values']['main']; // Success
+        } else {
+          // Throw an exception with the error message from the API
+          final errorMessage = result[1] is String
+              ? result[1]
+              : 'Unknown API Error';
+          throw Exception(errorMessage);
+        }
+      } else if (result[0] == 6) {
+        return {
+          'installed': false,
+        };
+      }
+      // Handle cases where the result is not in the expected format
+      return result;
+    }
+
+    return getData(podkopConfig);
+  }
+
+  Future<bool> installPodkop() async {
+
+    final credentials = await _secureStorageService.getCredentials();
+    final ip = credentials['ipAddress'];
+    final user = credentials['username'];
+    final pass = credentials['password'];
+    if (ip == null || user == null || pass == null) {
+      return false;
+    }
+    final socket = await SSHSocket.connect(ip, 22);
+    final client = SSHClient(
+      socket,
+      username: user,
+      onPasswordRequest: () => pass,
+    );
+
+    final shell = await client.shell();
+    shell.write(utf8.encode(
+        'sh <(wget -O - https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh)\n'
+    ));
+    shell.stdout.listen((data) {
+      final output = utf8.decode(data);
+      if (kDebugMode) {
+        print(output);
+      }
+
+      if (output.contains("Need a Russian translation?")) {
+        //TODO: add russian language support
+        shell.write(utf8.encode('n\n'));
+        shell.write(utf8.encode('exit\n'));
+      }
+    });
+
+    await shell.done;
+    client.close();
+    await client.done;
+    return true;
   }
 
   @override
