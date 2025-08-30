@@ -1,66 +1,172 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
+import 'package:dio/dio.dart';
+import 'package:luci_mobile/services/interfaces/api_service_interface.dart';
 import '../utils/http_client_manager.dart';
 import '../utils/logger.dart';
-import 'package:luci_mobile/services/interfaces/api_service_interface.dart';
+
+class LoginResult {
+  final String? token;
+  final bool actualUseHttps;
+
+  LoginResult({required this.token, required this.actualUseHttps});
+}
 
 Uri _buildUrl(String ipAddress, bool useHttps, String path) {
   final scheme = useHttps ? 'https' : 'http';
-  return Uri.parse('$scheme://$ipAddress$path');
+  // Handle cases where ipAddress might already include a port
+  String host = ipAddress;
+  // Don't add scheme if the address already has one (shouldn't happen with our parser)
+  if (host.startsWith('http://') || host.startsWith('https://')) {
+    return Uri.parse('$host$path');
+  }
+  return Uri.parse('$scheme://$host$path');
 }
 
 class RealApiService implements IApiService {
   final HttpClientManager _httpClientManager = HttpClientManager();
 
-  @override
-  http.Client createHttpClient() {
-    // Return a basic HTTP client without custom SSL handling
-    return http.Client();
+  Dio _createHttpClient(
+    bool useHttps,
+    String hostWithPort, {
+    BuildContext? context,
+  }) {
+    return _httpClientManager.getClient(
+      hostWithPort,
+      useHttps,
+      context: context,
+    );
   }
 
   @override
-  http.Client createHttpClientWithParams(bool useHttps, String host) {
-    return _createHttpClient(useHttps, host);
-  }
-
-  http.Client _createHttpClient(bool useHttps, String host, {BuildContext? context}) {
-    return _httpClientManager.getClient(host, useHttps, context: context);
-  }
-
-  @override
-  Future<String> login(String ipAddress, String username, String password, bool useHttps, {BuildContext? context}) async {
-    final result = await _login(ipAddress, username, password, useHttps, context: context);
-    if (result == null) {
+  Future<String> login(
+    String ipAddress,
+    String username,
+    String password,
+    bool useHttps, {
+    BuildContext? context,
+  }) async {
+    final result = await loginWithProtocolDetection(
+      ipAddress,
+      username,
+      password,
+      useHttps,
+      context: context,
+    );
+    if (result.token == null) {
       throw Exception('Login failed');
     }
-    return result;
+    return result.token!;
+  }
+
+  /// Login with automatic HTTPS redirect detection
+  /// Returns both the auth token and the actual protocol used
+  Future<LoginResult> loginWithProtocolDetection(
+    String ipAddress,
+    String username,
+    String password,
+    bool initialUseHttps, {
+    BuildContext? context,
+  }) async {
+    // First try with the initial protocol
+    var result = await _login(
+      ipAddress,
+      username,
+      password,
+      initialUseHttps,
+      context: context,
+      checkRedirect: true,
+    );
+
+    // Check if we got a redirect marker
+    if (result != null && result.startsWith('HTTPS_REDIRECT:')) {
+      final token = result.substring('HTTPS_REDIRECT:'.length);
+      Logger.info('Login successful via HTTP to HTTPS redirect');
+      return LoginResult(token: token, actualUseHttps: true);
+    }
+
+    if (result != null) {
+      return LoginResult(token: result, actualUseHttps: initialUseHttps);
+    }
+
+    // If login failed and we were using HTTP, try HTTPS in case of redirect
+    if (!initialUseHttps) {
+      Logger.info('HTTP login failed or redirected, attempting HTTPS');
+      final safeContext = context?.mounted == true ? context : null;
+      result = await _login(
+        ipAddress,
+        username,
+        password,
+        true, // Try with HTTPS
+        context: safeContext, // ignore: use_build_context_synchronously
+        checkRedirect: false,
+      );
+
+      if (result != null) {
+        Logger.info('Login successful with HTTPS after redirect detection');
+        return LoginResult(token: result, actualUseHttps: true);
+      }
+    }
+
+    return LoginResult(token: null, actualUseHttps: initialUseHttps);
   }
 
   Future<String?> _login(
     String ipAddress,
     String username,
     String password,
-    bool useHttps,
-    {BuildContext? context}
-  ) async {
+    bool useHttps, {
+    BuildContext? context,
+    bool checkRedirect = false,
+  }) async {
     final client = _createHttpClient(useHttps, ipAddress, context: context);
     final uri = _buildUrl(ipAddress, useHttps, '/cgi-bin/luci/');
     final params =
         'luci_username=${Uri.encodeComponent(username)}&luci_password=${Uri.encodeComponent(password)}';
 
     try {
+      // Normal POST request - Dio will follow redirects by default
       final response = await client.post(
-        uri,
-        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-        body: params,
-      ).timeout(const Duration(seconds: 10));
+        uri.toString(),
+        data: params,
+        options: Options(
+          contentType: Headers.formUrlEncodedContentType,
+          followRedirects: true,
+          validateStatus: (code) => code != null && code >= 200 && code < 400 || code == 302,
+        ),
+      );
+
+      // Check if we were redirected to HTTPS (only relevant for initial HTTP attempts)
+      if (checkRedirect && !useHttps) {
+        final finalUrl = response.realUri;
+        if (finalUrl.scheme == 'https') {
+          Logger.info('Detected HTTP to HTTPS redirect: $uri -> $finalUrl');
+          // If we got a successful login after redirect, extract the token
+          if (response.statusCode == 302 || response.statusCode == 200) {
+            final setCookies = response.headers.map['set-cookie'];
+            if (setCookies != null && setCookies.isNotEmpty) {
+              final cookies = setCookies.join(',').split(',');
+              for (final cookie in cookies) {
+                if (cookie.contains('sysauth')) {
+                  final cookieValue = cookie.split(';')[0].split('=')[1];
+                  // Signal that HTTPS should be used by returning a special marker
+                  // We'll handle this in loginWithProtocolDetection
+                  return 'HTTPS_REDIRECT:$cookieValue';
+                }
+              }
+            }
+          }
+          // No token found, trigger HTTPS retry
+          return null;
+        }
+      }
 
       if (response.statusCode == 302) {
         // Parse Set-Cookie headers to find sysauth cookie
-        final setCookieHeaders = response.headers['set-cookie'];
-        if (setCookieHeaders != null) {
-          final cookies = setCookieHeaders.split(',');
+        final setCookies = response.headers.map['set-cookie'];
+        if (setCookies != null && setCookies.isNotEmpty) {
+          final cookies = setCookies.join(',').split(',');
           for (final cookie in cookies) {
             if (cookie.contains('sysauth')) {
               final cookieValue = cookie.split(';')[0].split('=')[1];
@@ -70,32 +176,38 @@ class RealApiService implements IApiService {
         }
       }
       return null;
-    } catch (e, stack) {
+    } on DioException catch (e, stack) {
       Logger.exception('Login failed', e, stack);
-      
+
       // Check if this is a certificate error and we have context to show dialog
-      if (useHttps && context != null && context.mounted && e.toString().contains('CERTIFICATE_VERIFY_FAILED')) {
+      final isCertError =
+          e.error is HandshakeException || e.message?.contains('CERTIFICATE_VERIFY_FAILED') == true;
+      if (useHttps && context != null && context.mounted && isCertError) {
         // Try to prompt for certificate acceptance
         final accepted = await _httpClientManager.promptForCertificateAcceptance(
           context: context,
-          host: ipAddress,
+          hostWithPort: ipAddress,
           useHttps: useHttps,
         );
-        
+
         if (accepted && context.mounted) {
           // Create a new client and retry the login
           final retryClient = _createHttpClient(useHttps, ipAddress, context: context);
           try {
             final retryResponse = await retryClient.post(
-              uri,
-              headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-              body: params,
-            ).timeout(const Duration(seconds: 10));
+              uri.toString(),
+              data: params,
+              options: Options(
+                contentType: Headers.formUrlEncodedContentType,
+                followRedirects: true,
+                validateStatus: (code) => code != null && code >= 200 && code < 400 || code == 302,
+              ),
+            );
 
             if (retryResponse.statusCode == 302) {
-              final setCookieHeaders = retryResponse.headers['set-cookie'];
-              if (setCookieHeaders != null) {
-                final cookies = setCookieHeaders.split(',');
+              final setCookies = retryResponse.headers.map['set-cookie'];
+              if (setCookies != null && setCookies.isNotEmpty) {
+                final cookies = setCookies.join(',').split(',');
                 for (final cookie in cookies) {
                   if (cookie.contains('sysauth')) {
                     final cookieValue = cookie.split(';')[0].split('=')[1];
@@ -104,18 +216,26 @@ class RealApiService implements IApiService {
                 }
               }
             }
-          } catch (retryError, retryStack) {
+          } on DioException catch (retryError, retryStack) {
             Logger.exception('Login retry failed', retryError, retryStack);
           }
         }
       }
-      
+
       rethrow;
     }
   }
 
   @override
-  Future<dynamic> call(String ipAddress, String sysauth, bool useHttps, {required String object, required String method, Map<String, dynamic>? params, BuildContext? context}) async {
+  Future<dynamic> call(
+    String ipAddress,
+    String sysauth,
+    bool useHttps, {
+    required String object,
+    required String method,
+    Map<String, dynamic>? params,
+    BuildContext? context,
+  }) async {
     return await callWithContext(
       ipAddress,
       sysauth,
@@ -129,13 +249,17 @@ class RealApiService implements IApiService {
 
   // Simplified call method for reviewer mode
   @override
-  Future<dynamic> callSimple(String object, String method, Map<String, dynamic> params) async {
+  Future<dynamic> callSimple(
+    String object,
+    String method,
+    Map<String, dynamic> params,
+  ) async {
     // Use default values for ipAddress, sysauth, and useHttps
     // This is primarily for mock/testing scenarios
     return await call(
-      'localhost',  // Default IP address
-      '',           // Default sysauth (empty for mock scenarios)
-      false,        // Default to HTTP
+      'localhost', // Default IP address
+      '', // Default sysauth (empty for mock scenarios)
+      false, // Default to HTTP
       object: object,
       method: method,
       params: params,
@@ -158,25 +282,22 @@ class RealApiService implements IApiService {
       'jsonrpc': '2.0',
       'id': 1,
       'method': 'call',
-      'params': [
-        sysauth,
-        object,
-        method,
-        params ?? {},
-      ]
+      'params': [sysauth, object, method, params ?? {}],
     };
 
     try {
-      final response = await client
-          .post(
-            url,
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode(rpcPayload),
-          )
-          .timeout(const Duration(seconds: 10));
+      final response = await client.post(
+        url.toString(),
+        data: jsonEncode(rpcPayload),
+        options: Options(
+          headers: {'Content-Type': 'application/json'},
+        ),
+      );
 
       if (response.statusCode == 200) {
-        final decoded = jsonDecode(response.body);
+        final decoded = response.data is String
+            ? jsonDecode(response.data as String)
+            : response.data;
         if (decoded['error'] != null) {
           throw Exception('RPC error: ${decoded['error']['message']}');
         }
@@ -192,18 +313,33 @@ class RealApiService implements IApiService {
       } else {
         throw Exception('Failed to call RPC: HTTP ${response.statusCode}');
       }
-    } catch (e, stack) {
+    } on DioException catch (e, stack) {
       Logger.exception('API call failed', e, stack);
       rethrow;
     }
   }
 
   @override
-  Future<bool> reboot(String ipAddress, String sysauth, bool useHttps, {BuildContext? context}) async {
-    return await rebootWithContext(ipAddress, sysauth, useHttps, context: context);
+  Future<bool> reboot(
+    String ipAddress,
+    String sysauth,
+    bool useHttps, {
+    BuildContext? context,
+  }) async {
+    return await rebootWithContext(
+      ipAddress,
+      sysauth,
+      useHttps,
+      context: context,
+    );
   }
 
-  Future<bool> rebootWithContext(String ipAddress, String sysauth, bool useHttps, {BuildContext? context}) async {
+  Future<bool> rebootWithContext(
+    String ipAddress,
+    String sysauth,
+    bool useHttps, {
+    BuildContext? context,
+  }) async {
     try {
       final result = await callWithContext(
         ipAddress,
@@ -231,7 +367,9 @@ class RealApiService implements IApiService {
     // This method is mainly used by the mock service
     // For real implementation, individual interface queries via fetchAssociatedStationsWithContext should be used
     // The app_state.dart should call fetchAllAssociatedWirelessMacsWithContext instead
-    throw UnimplementedError('Use fetchAllAssociatedWirelessMacsWithContext for real implementation');
+    throw UnimplementedError(
+      'Use fetchAllAssociatedWirelessMacsWithContext for real implementation',
+    );
   }
 
   /// Fetches all associated wireless MAC addresses from all wireless interfaces for real API
@@ -253,12 +391,14 @@ class RealApiService implements IApiService {
         context: context,
       );
 
-      if (wirelessResult is List && wirelessResult.length > 1 && wirelessResult[0] == 0) {
+      if (wirelessResult is List &&
+          wirelessResult.length > 1 &&
+          wirelessResult[0] == 0) {
         final wirelessData = wirelessResult[1] as Map<String, dynamic>?;
         if (wirelessData == null) return {};
 
         final result = <String, Set<String>>{};
-        
+
         // For each wireless radio, get the associated stations
         for (final entry in wirelessData.entries) {
           final radioData = entry.value as Map<String, dynamic>?;
@@ -320,7 +460,9 @@ class RealApiService implements IApiService {
         if (data is Map && data['results'] is List) {
           final resultsList = data['results'] as List;
           return resultsList
-              .map((entry) => (entry as Map<String, dynamic>)['mac']?.toString())
+              .map(
+                (entry) => (entry as Map<String, dynamic>)['mac']?.toString(),
+              )
               .where((mac) => mac != null)
               .cast<String>()
               .toList();
@@ -334,7 +476,13 @@ class RealApiService implements IApiService {
   }
 
   @override
-  Future<Map<String, dynamic>?> fetchWireGuardPeers({required String ipAddress, required String sysauth, required bool useHttps, required String interface, BuildContext? context}) async {
+  Future<Map<String, dynamic>?> fetchWireGuardPeers({
+    required String ipAddress,
+    required String sysauth,
+    required bool useHttps,
+    required String interface,
+    BuildContext? context,
+  }) async {
     return await fetchWireGuardPeersWithContext(
       ipAddress: ipAddress,
       sysauth: sysauth,
@@ -364,7 +512,7 @@ class RealApiService implements IApiService {
         params: {},
         context: context,
       );
-      
+
       // Handle LuCI RPC format: [status, data]
       if (result is List && result.length > 1 && result[0] == 0) {
         final data = result[1] as Map<String, dynamic>?;
@@ -372,7 +520,7 @@ class RealApiService implements IApiService {
           return _parseWireGuardFromInstances(data, interface);
         }
       }
-      
+
       return null;
     } catch (e, stack) {
       Logger.exception('Failed to fetch WireGuard peers', e, stack);
@@ -380,15 +528,17 @@ class RealApiService implements IApiService {
     }
   }
 
-  Map<String, dynamic>? _parseWireGuardFromInstances(Map<String, dynamic> data, String targetInterface) {
+  Map<String, dynamic>? _parseWireGuardFromInstances(
+    Map<String, dynamic> data,
+    String targetInterface,
+  ) {
     final wireguardData = <String, dynamic>{};
-    
+
     data.forEach((key, value) {
       if (value is Map<String, dynamic>) {
-        
         // Look for peers in the interface data
         final peers = <String, dynamic>{};
-        
+
         // The structure might have peers in different formats
         if (value['peers'] is List) {
           final peersList = value['peers'] as List;
@@ -399,7 +549,11 @@ class RealApiService implements IApiService {
                 peers[publicKey] = {
                   'public_key': publicKey,
                   'endpoint': peer['endpoint'] ?? 'N/A',
-                  'last_handshake': int.tryParse(peer['latest_handshake']?.toString() ?? '0') ?? 0,
+                  'last_handshake':
+                      int.tryParse(
+                        peer['latest_handshake']?.toString() ?? '0',
+                      ) ??
+                      0,
                 };
               }
             }
@@ -411,21 +565,22 @@ class RealApiService implements IApiService {
               peers[peerKey] = {
                 'public_key': peerKey,
                 'endpoint': peerData['endpoint'] ?? 'N/A',
-                'last_handshake': int.tryParse(peerData['latest_handshake']?.toString() ?? '0') ?? 0,
+                'last_handshake':
+                    int.tryParse(
+                      peerData['latest_handshake']?.toString() ?? '0',
+                    ) ??
+                    0,
               };
             }
           });
         }
-        
+
         if (peers.isNotEmpty) {
-          wireguardData[key] = {
-            'interface': key,
-            'peers': peers,
-          };
+          wireguardData[key] = {'interface': key, 'peers': peers};
         }
       }
     });
-    
+
     if (targetInterface.isEmpty) {
       return wireguardData;
     } else {
@@ -434,24 +589,34 @@ class RealApiService implements IApiService {
   }
 
   @override
-  Future<dynamic> uciSet(String ipAddress, String sysauth, bool useHttps, {required String config, required String section, required Map<String, String> values, BuildContext? context}) async {
+  Future<dynamic> uciSet(
+    String ipAddress,
+    String sysauth,
+    bool useHttps, {
+    required String config,
+    required String section,
+    required Map<String, String> values,
+    BuildContext? context,
+  }) async {
     return await callWithContext(
       ipAddress,
       sysauth,
       useHttps,
       object: 'uci',
       method: 'set',
-      params: {
-        'config': config,
-        'section': section,
-        'values': values,
-      },
+      params: {'config': config, 'section': section, 'values': values},
       context: context,
     );
   }
 
   @override
-  Future<dynamic> uciCommit(String ipAddress, String sysauth, bool useHttps, {required String config, BuildContext? context}) async {
+  Future<dynamic> uciCommit(
+    String ipAddress,
+    String sysauth,
+    bool useHttps, {
+    required String config,
+    BuildContext? context,
+  }) async {
     return await callWithContext(
       ipAddress,
       sysauth,
@@ -464,7 +629,13 @@ class RealApiService implements IApiService {
   }
 
   @override
-  Future<dynamic> systemExec(String ipAddress, String sysauth, bool useHttps, {required String command, BuildContext? context}) async {
+  Future<dynamic> systemExec(
+    String ipAddress,
+    String sysauth,
+    bool useHttps, {
+    required String command,
+    BuildContext? context,
+  }) async {
     return await callWithContext(
       ipAddress,
       sysauth,
