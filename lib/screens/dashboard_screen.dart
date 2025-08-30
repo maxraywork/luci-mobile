@@ -216,12 +216,37 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
   }
 
   Widget _buildRealtimeThroughputCard(AppState appState) {
+    final prefs = appState.dashboardPreferences;
+
+    // Determine which throughput data to use
+    List<double> rxHistory;
+    List<double> txHistory;
+    double currentRxRate;
+    double currentTxRate;
+    String throughputLabel = '';
+
+    if (!prefs.showAllThroughput && prefs.primaryThroughputInterface != null) {
+      // Use specific interface throughput
+      final interface = prefs.primaryThroughputInterface!;
+      rxHistory = appState.getRxHistoryForInterface(interface);
+      txHistory = appState.getTxHistoryForInterface(interface);
+      currentRxRate = appState.getCurrentRxRateForInterface(interface);
+      currentTxRate = appState.getCurrentTxRateForInterface(interface);
+      throughputLabel = ' - $interface';
+    } else {
+      // Use combined throughput
+      rxHistory = appState.rxHistory;
+      txHistory = appState.txHistory;
+      currentRxRate = appState.currentRxRate;
+      currentTxRate = appState.currentTxRate;
+    }
+
     // Show loading state if we don't have any throughput data yet
     final hasValidData =
-        appState.rxHistory.isNotEmpty ||
-        appState.txHistory.isNotEmpty ||
-        appState.currentRxRate > 0 ||
-        appState.currentTxRate > 0; // Show data as soon as we have any throughput info
+        rxHistory.isNotEmpty ||
+        txHistory.isNotEmpty ||
+        currentRxRate > 0 ||
+        currentTxRate > 0; // Show data as soon as we have any throughput info
     // Only show switching state if we're loading AND no dashboard data is available (true router switch)
     final isSwitchingRouter =
         appState.isLoading && appState.dashboardData == null;
@@ -233,6 +258,21 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          if (throughputLabel.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 8.0),
+              child: Center(
+                child: Text(
+                  'Throughput$throughputLabel',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.onSurface.withValues(alpha: 0.7),
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+            ),
           Padding(
             padding: const EdgeInsets.symmetric(
               horizontal: 16.0,
@@ -245,13 +285,13 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                   Icons.arrow_downward,
                   Colors.green,
                   '',
-                  isSwitchingRouter ? 0.0 : appState.currentRxRate,
+                  isSwitchingRouter ? 0.0 : currentRxRate,
                 ),
                 _buildSpeedIndicator(
                   Icons.arrow_upward,
                   Colors.blue,
                   '',
-                  isSwitchingRouter ? 0.0 : appState.currentTxRate,
+                  isSwitchingRouter ? 0.0 : currentTxRate,
                 ),
               ],
             ),
@@ -324,11 +364,11 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                             ),
                           ),
                           lineBarsData: [
-                            _buildLineChartBarData(appState.rxHistory, [
+                            _buildLineChartBarData(rxHistory, [
                               Colors.green.shade700,
                               Colors.green.shade400,
                             ]),
-                            _buildLineChartBarData(appState.txHistory, [
+                            _buildLineChartBarData(txHistory, [
                               Colors.blue.shade700,
                               Colors.blue.shade400,
                             ]),
@@ -447,13 +487,16 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
         gradient: LinearGradient(colors: gradientColors),
         barWidth: 3,
         isStrokeCapRound: true,
-        dotData: FlDotData(show: true, getDotPainter: (spot, percent, barData, index) {
-          return FlDotCirclePainter(
-            radius: 3,
-            color: gradientColors.first,
-            strokeWidth: 0,
-          );
-        }),
+        dotData: FlDotData(
+          show: true,
+          getDotPainter: (spot, percent, barData, index) {
+            return FlDotCirclePainter(
+              radius: 3,
+              color: gradientColors.first,
+              strokeWidth: 0,
+            );
+          },
+        ),
         belowBarData: BarAreaData(
           show: true,
           gradient: LinearGradient(
@@ -464,7 +507,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
         ),
       );
     }
-    
+
     // Don't show chart data if we don't have any data points
     if (data.isEmpty) {
       return LineChartBarData(
@@ -688,59 +731,146 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
   }
 
   Widget _buildWirelessNetworksCard(AppState appState) {
+    final prefs = appState.dashboardPreferences;
     final wirelessRadios =
         appState.dashboardData?['wireless'] as Map<String, dynamic>?;
-    if (wirelessRadios == null || wirelessRadios.isEmpty) {
-      return const SizedBox.shrink();
-    }
+    final uciWirelessConfig = appState.dashboardData?['uciWirelessConfig'];
+
+    // Track which interfaces we've already added from runtime data
+    final addedInterfaces = <String>{};
 
     List<Widget> networkCardWidgets = [];
-    wirelessRadios.forEach((radioName, radioData) {
-      final interfaces = radioData['interfaces'] as List<dynamic>?;
-      if (interfaces != null) {
-        for (var interface in interfaces) {
-          final config = interface['config'] ?? {};
-          final iwinfo = interface['iwinfo'] ?? {};
-          final ssid = iwinfo['ssid'] ?? config['ssid'] ?? 'N/A';
-          if (ssid == 'N/A') continue;
 
-          final deviceName = config['device'] ?? radioName;
-          final isEnabled = !(config['disabled'] as bool? ?? false);
-          final channel = (iwinfo['channel'] ?? config['channel'] ?? 'N/A')
-              .toString();
-          final signal = iwinfo['signal'] as int?;
+    // First, add interfaces from runtime wireless data
+    if (wirelessRadios != null) {
+      wirelessRadios.forEach((radioName, radioData) {
+        final interfaces = radioData['interfaces'] as List<dynamic>?;
+        if (interfaces != null) {
+          for (var interface in interfaces) {
+            final config = interface['config'] ?? {};
+            final iwinfo = interface['iwinfo'] ?? {};
+            final ssid = iwinfo['ssid'] ?? config['ssid'] ?? 'N/A';
+            if (ssid == 'N/A') continue;
 
-          networkCardWidgets.add(
-            Card(
-              margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
-              elevation: 2,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(18),
-              ),
-              clipBehavior: Clip.antiAlias,
-              child: InkWell(
-                borderRadius: BorderRadius.circular(18),
-                onLongPress: () {
-                  // Navigate to interfaces tab with the specific interface name
-                  final appState = ref.read(appStateProvider);
-                  appState.requestTab(2, interfaceToScroll: deviceName);
-                },
-                child: Padding(
-                  padding: const EdgeInsets.all(8.0),
-                  child: _buildWirelessInfoCardContent(
-                    context,
-                    ssid: ssid,
-                    isEnabled: isEnabled,
-                    signal: signal,
-                    channel: channel,
+            final deviceName = config['device'] ?? radioName;
+            final interfaceId = '$ssid ($deviceName)';
+            final uciName = interface['section'] as String?;
+
+            if (uciName != null) {
+              addedInterfaces.add(uciName);
+            }
+
+            // If preferences are not empty, check if this interface should be shown
+            // Empty preferences means show all interfaces by default
+            if (prefs.enabledWirelessInterfaces.isNotEmpty &&
+                !prefs.enabledWirelessInterfaces.contains(interfaceId)) {
+              continue; // Skip this interface
+            }
+
+            final isEnabled = !(config['disabled'] as bool? ?? false);
+            final channel = (iwinfo['channel'] ?? config['channel'] ?? 'N/A')
+                .toString();
+            final signal = iwinfo['signal'] as int?;
+
+            networkCardWidgets.add(
+              Card(
+                margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+                elevation: 2,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(18),
+                  onLongPress: () {
+                    // Navigate to interfaces tab with the specific interface name
+                    final appState = ref.read(appStateProvider);
+                    appState.requestTab(2, interfaceToScroll: deviceName);
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.all(8.0),
+                    child: _buildWirelessInfoCardContent(
+                      context,
+                      ssid: ssid,
+                      isEnabled: isEnabled,
+                      signal: signal,
+                      channel: channel,
+                    ),
                   ),
                 ),
               ),
-            ),
-          );
+            );
+          }
         }
+      });
+    }
+
+    // Now add disabled interfaces from UCI config that aren't in runtime data
+    if (uciWirelessConfig != null) {
+      final uciValues = uciWirelessConfig['values'] as Map?;
+      if (uciValues != null) {
+        final uciRadios = <String, Map>{};
+        final uciInterfaces = <String, Map>{};
+
+        // Categorize UCI entries
+        uciValues.forEach((key, value) {
+          final typedValue = value as Map?;
+          if (typedValue?['.type'] == 'wifi-device') {
+            uciRadios[key] = typedValue!;
+          } else if (typedValue?['.type'] == 'wifi-iface') {
+            uciInterfaces[key] = typedValue!;
+          }
+        });
+
+        // Add interfaces that aren't in runtime data
+        uciInterfaces.forEach((uciName, config) {
+          if (!addedInterfaces.contains(uciName)) {
+            final ssid = config['ssid'] ?? 'Unnamed';
+            final device = config['device'] ?? '';
+            final interfaceId = '$ssid ($device)';
+
+            // Check if this interface should be shown based on preferences
+            if (prefs.enabledWirelessInterfaces.isNotEmpty &&
+                !prefs.enabledWirelessInterfaces.contains(interfaceId)) {
+              return; // Skip this interface
+            }
+
+            final isRadioEnabled = uciRadios[device]?['disabled'] != '1';
+            final isIfaceEnabled = config['disabled'] != '1';
+            final isEnabled = isRadioEnabled && isIfaceEnabled;
+
+            networkCardWidgets.add(
+              Card(
+                margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+                elevation: 2,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(18),
+                  onLongPress: () {
+                    // Navigate to interfaces tab with the specific interface name
+                    final appState = ref.read(appStateProvider);
+                    appState.requestTab(2, interfaceToScroll: device);
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.all(8.0),
+                    child: _buildWirelessInfoCardContent(
+                      context,
+                      ssid: ssid,
+                      isEnabled: isEnabled,
+                      signal: null, // No signal for disabled interfaces
+                      channel: config['channel']?.toString() ?? 'N/A',
+                    ),
+                  ),
+                ),
+              ),
+            );
+          }
+        });
       }
-    });
+    }
 
     if (networkCardWidgets.isEmpty) {
       return const SizedBox.shrink();
@@ -838,19 +968,38 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     }
   }
 
-  IconData _getInterfaceIcon(String proto) {
+  IconData _getInterfaceIcon(String name, String proto) {
+    final lower = name.toLowerCase();
+    
+    // Check name-based patterns first
+    if (lower.contains('wan')) return Icons.public_rounded;
+    if (lower.contains('lan')) return Icons.router_rounded;
+    if (lower.contains('iot')) return Icons.sensors_rounded;
+    if (lower.contains('guest')) return Icons.people_rounded;
+    if (lower.contains('dmz')) return Icons.security_rounded;
+    if (lower.contains('docker')) return Icons.computer_rounded;
+    if (lower.contains('bridge') || lower.startsWith('br-')) return Icons.hub_rounded;
+    if (lower.contains('vlan')) return Icons.layers_rounded;
+    if (lower.startsWith('eth')) return Icons.cable_rounded;
+    if (lower.startsWith('wlan')) return Icons.wifi_rounded;
+    
+    // Check protocol-based patterns
     switch (proto) {
       case 'wireguard':
       case 'openvpn':
         return Icons.vpn_key_rounded;
       case 'pppoe':
+        return Icons.settings_ethernet_rounded;
       case 'dhcp':
+      case 'static':
+        return Icons.lan_rounded;
       default:
-        return Icons.public_rounded;
+        return Icons.lan_rounded;
     }
   }
 
   Widget _buildInterfaceStatusCards(AppState appState) {
+    final prefs = appState.dashboardPreferences;
     final interfaces =
         appState.dashboardData?['interfaceDump']?['interface']
             as List<dynamic>?;
@@ -861,11 +1010,17 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     final wanVpnInterfaces = interfaces.where((item) {
       final interface = item as Map<String, dynamic>;
       final name = interface['interface'] as String? ?? '';
-      final proto = interface['proto'] as String? ?? '';
-      return name.startsWith('wan') ||
-          proto == 'pppoe' ||
-          proto == 'wireguard' ||
-          proto == 'openvpn';
+
+      // Skip loopback interface
+      if (name == 'loopback' || name == 'lo') return false;
+
+      // If preferences are empty, show all interfaces by default
+      if (prefs.enabledWiredInterfaces.isEmpty) {
+        return true; // Show all interfaces when no specific preferences
+      }
+
+      // Otherwise, check if this interface is in the enabled list
+      return prefs.enabledWiredInterfaces.contains(name);
     }).toList();
 
     if (wanVpnInterfaces.isEmpty) {
@@ -904,7 +1059,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                 crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
                   Icon(
-                    _getInterfaceIcon(proto),
+                    _getInterfaceIcon(name, proto),
                     color: Theme.of(context).colorScheme.primary,
                     size: 20,
                   ),
@@ -1077,249 +1232,243 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
   @override
   Widget build(BuildContext context) {
     final appState = ref.watch(appStateProvider);
-        final List<model.Router> routers = appState.routers;
-        final model.Router? selected = appState.selectedRouter;
-        final boardInfo =
-            appState.dashboardData?['boardInfo'] as Map<String, dynamic>?;
-        final hostname = boardInfo?['hostname']?.toString();
-        final headerText = (hostname != null && hostname.isNotEmpty)
-            ? hostname
-            : (selected?.ipAddress ?? 'Loading...');
+    final List<model.Router> routers = appState.routers;
+    final model.Router? selected = appState.selectedRouter;
+    final boardInfo =
+        appState.dashboardData?['boardInfo'] as Map<String, dynamic>?;
+    final hostname = boardInfo?['hostname']?.toString();
+    final headerText = (hostname != null && hostname.isNotEmpty)
+        ? hostname
+        : (selected?.ipAddress ?? 'Loading...');
     return Scaffold(
-          appBar: LuciAppBar(
-            centerTitle: true,
-            title: null, // Always use titleWidget now
-            titleWidget: routers.length > 1
-                ? Center(
-                    child: Container(
-                      decoration: BoxDecoration(
-                        color: Theme.of(
-                          context,
-                        ).colorScheme.surfaceContainerLowest,
-                        borderRadius: BorderRadius.circular(10),
-                        border: Border.all(
-                          color: Theme.of(context).colorScheme.outlineVariant,
-                          width: 1.1,
-                        ),
-                      ),
-                      constraints: const BoxConstraints(minHeight: 36),
-                      child: Material(
-                        color: Colors.transparent,
-                        borderRadius: BorderRadius.circular(10),
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(10),
-                          onTap: () async {
-                            final selectedId = await showModalBottomSheet<String>(
-                              context: context,
-                              isScrollControlled: false,
-                              backgroundColor: Theme.of(
-                                context,
-                              ).colorScheme.surface,
-                              shape: const RoundedRectangleBorder(
-                                borderRadius: BorderRadius.vertical(
-                                  top: Radius.circular(18),
-                                ),
-                              ),
-                              builder: (context) {
-                                return SafeArea(
-                                  child: Padding(
-                                    padding: const EdgeInsets.only(
-                                      top: 12,
-                                      left: 8,
-                                      right: 8,
-                                      bottom: 8,
-                                    ),
-                                    child: Column(
-                                      mainAxisSize: MainAxisSize.min,
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        Center(
-                                          child: Container(
-                                            width: 40,
-                                            height: 4,
-                                            margin: const EdgeInsets.only(
-                                              bottom: 12,
-                                            ),
-                                            decoration: BoxDecoration(
-                                              color: Theme.of(
-                                                context,
-                                              ).colorScheme.outlineVariant,
-                                              borderRadius:
-                                                  BorderRadius.circular(2),
-                                            ),
-                                          ),
-                                        ),
-                                        Padding(
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 12.0,
-                                            vertical: 4,
-                                          ),
-                                          child: Center(
-                                            child: Text(
-                                              'Select Router',
-                                              style: Theme.of(context)
-                                                  .textTheme
-                                                  .titleMedium
-                                                  ?.copyWith(
-                                                    fontWeight: FontWeight.bold,
-                                                  ),
-                                              textAlign: TextAlign.center,
-                                            ),
-                                          ),
-                                        ),
-                                        const Divider(height: 16),
-                                        ...routers.map((r) {
-                                          final isSelected =
-                                              r.id == selected?.id;
-                                          String routerTitle;
-                                          bool isStale = false;
-                                          if (isSelected && boardInfo != null) {
-                                            final hostname =
-                                                boardInfo['hostname']
-                                                    ?.toString();
-                                            routerTitle =
-                                                (hostname != null &&
-                                                    hostname.isNotEmpty)
-                                                ? hostname
-                                                : (r.lastKnownHostname ??
-                                                      r.ipAddress);
-                                          } else if (r.lastKnownHostname !=
-                                                  null &&
-                                              r.lastKnownHostname!.isNotEmpty) {
-                                            routerTitle = r.lastKnownHostname!;
-                                            isStale = true;
-                                          } else {
-                                            routerTitle = r.ipAddress;
-                                          }
-                                          return ListTile(
-                                            leading: Icon(
-                                              Icons.router,
-                                              color: isSelected
-                                                  ? Theme.of(
-                                                      context,
-                                                    ).colorScheme.primary
-                                                  : Theme.of(context)
-                                                        .colorScheme
-                                                        .onSurfaceVariant,
-                                            ),
-                                            title: Tooltip(
-                                              message: isStale
-                                                  ? 'Last known hostname (may be out of date)'
-                                                  : '',
-                                              child: Text(
-                                                routerTitle,
-                                                style: Theme.of(context)
-                                                    .textTheme
-                                                    .titleMedium
-                                                    ?.copyWith(
-                                                      fontWeight:
-                                                          FontWeight.bold,
-                                                      color: isStale
-                                                          ? Theme.of(context)
-                                                                .colorScheme
-                                                                .onSurfaceVariant
-                                                                .withValues(
-                                                                  alpha: 0.7,
-                                                                )
-                                                          : Theme.of(context)
-                                                                .colorScheme
-                                                                .onSurface,
-                                                    ),
-                                                overflow: TextOverflow.ellipsis,
-                                              ),
-                                            ),
-                                            subtitle: Text(
-                                              r.ipAddress,
-                                              style: Theme.of(
-                                                context,
-                                              ).textTheme.bodySmall,
-                                            ),
-                                            trailing: isSelected
-                                                ? Icon(
-                                                    Icons.check_circle,
-                                                    color: Theme.of(
-                                                      context,
-                                                    ).colorScheme.primary,
-                                                  )
-                                                : null,
-                                            selected: isSelected,
-                                            selectedTileColor: Theme.of(context)
-                                                .colorScheme
-                                                .primary
-                                                .withValues(alpha: 0.07),
-                                            shape: RoundedRectangleBorder(
-                                              borderRadius:
-                                                  BorderRadius.circular(12),
-                                            ),
-                                            onTap: () =>
-                                                Navigator.of(context).pop(r.id),
-                                          );
-                                        }),
-                                        const SizedBox(height: 8),
-                                      ],
-                                    ),
-                                  ),
-                                );
-                              },
-                            );
-                            if (selectedId != null &&
-                                selectedId != selected?.id &&
-                                context.mounted) {
-                              await appState.selectRouter(selectedId, context: context);
-                            }
-                          },
-                          child: Padding(
-                            padding: const EdgeInsets.only(
-                              left: 16.0,
-                              right: 8.0,
-                              top: 4.0,
-                              bottom: 4.0,
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              crossAxisAlignment: CrossAxisAlignment.center,
-                              children: [
-                                Text(
-                                  headerText,
-                                  style:
-                                      Theme.of(
-                                        context,
-                                      ).appBarTheme.titleTextStyle ??
-                                      Theme.of(
-                                        context,
-                                      ).textTheme.titleLarge?.copyWith(
-                                        fontWeight: FontWeight.bold,
-                                        color: Theme.of(
-                                          context,
-                                        ).appBarTheme.titleTextStyle?.color,
-                                      ),
-                                  overflow: TextOverflow.ellipsis,
-                                  textAlign: TextAlign.center,
-                                ),
-                                const SizedBox(width: 2),
-                                Icon(
-                                  Icons.arrow_drop_down,
-                                  size: 20,
-                                  color: Theme.of(
-                                    context,
-                                  ).colorScheme.onSurfaceVariant,
-                                ),
-                              ],
+      appBar: LuciAppBar(
+        centerTitle: true,
+        title: null, // Always use titleWidget now
+        titleWidget: routers.length > 1
+            ? Center(
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.surfaceContainerLowest,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: Theme.of(context).colorScheme.outlineVariant,
+                      width: 1.1,
+                    ),
+                  ),
+                  constraints: const BoxConstraints(minHeight: 36),
+                  child: Material(
+                    color: Colors.transparent,
+                    borderRadius: BorderRadius.circular(10),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(10),
+                      onTap: () async {
+                        final selectedId = await showModalBottomSheet<String>(
+                          context: context,
+                          isScrollControlled: false,
+                          backgroundColor: Theme.of(
+                            context,
+                          ).colorScheme.surface,
+                          shape: const RoundedRectangleBorder(
+                            borderRadius: BorderRadius.vertical(
+                              top: Radius.circular(18),
                             ),
                           ),
+                          builder: (context) {
+                            return SafeArea(
+                              child: Padding(
+                                padding: const EdgeInsets.only(
+                                  top: 12,
+                                  left: 8,
+                                  right: 8,
+                                  bottom: 8,
+                                ),
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Center(
+                                      child: Container(
+                                        width: 40,
+                                        height: 4,
+                                        margin: const EdgeInsets.only(
+                                          bottom: 12,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: Theme.of(
+                                            context,
+                                          ).colorScheme.outlineVariant,
+                                          borderRadius: BorderRadius.circular(
+                                            2,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    Padding(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 12.0,
+                                        vertical: 4,
+                                      ),
+                                      child: Center(
+                                        child: Text(
+                                          'Select Router',
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .titleMedium
+                                              ?.copyWith(
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                          textAlign: TextAlign.center,
+                                        ),
+                                      ),
+                                    ),
+                                    const Divider(height: 16),
+                                    ...routers.map((r) {
+                                      final isSelected = r.id == selected?.id;
+                                      String routerTitle;
+                                      bool isStale = false;
+                                      if (isSelected && boardInfo != null) {
+                                        final hostname = boardInfo['hostname']
+                                            ?.toString();
+                                        routerTitle =
+                                            (hostname != null &&
+                                                hostname.isNotEmpty)
+                                            ? hostname
+                                            : (r.lastKnownHostname ??
+                                                  r.ipAddress);
+                                      } else if (r.lastKnownHostname != null &&
+                                          r.lastKnownHostname!.isNotEmpty) {
+                                        routerTitle = r.lastKnownHostname!;
+                                        isStale = true;
+                                      } else {
+                                        routerTitle = r.ipAddress;
+                                      }
+                                      return ListTile(
+                                        leading: Icon(
+                                          Icons.router,
+                                          color: isSelected
+                                              ? Theme.of(
+                                                  context,
+                                                ).colorScheme.primary
+                                              : Theme.of(
+                                                  context,
+                                                ).colorScheme.onSurfaceVariant,
+                                        ),
+                                        title: Tooltip(
+                                          message: isStale
+                                              ? 'Last known hostname (may be out of date)'
+                                              : '',
+                                          child: Text(
+                                            routerTitle,
+                                            style: Theme.of(context)
+                                                .textTheme
+                                                .titleMedium
+                                                ?.copyWith(
+                                                  fontWeight: FontWeight.bold,
+                                                  color: isStale
+                                                      ? Theme.of(context)
+                                                            .colorScheme
+                                                            .onSurfaceVariant
+                                                            .withValues(
+                                                              alpha: 0.7,
+                                                            )
+                                                      : Theme.of(
+                                                          context,
+                                                        ).colorScheme.onSurface,
+                                                ),
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                        ),
+                                        subtitle: Text(
+                                          r.ipAddress,
+                                          style: Theme.of(
+                                            context,
+                                          ).textTheme.bodySmall,
+                                        ),
+                                        trailing: isSelected
+                                            ? Icon(
+                                                Icons.check_circle,
+                                                color: Theme.of(
+                                                  context,
+                                                ).colorScheme.primary,
+                                              )
+                                            : null,
+                                        selected: isSelected,
+                                        selectedTileColor: Theme.of(context)
+                                            .colorScheme
+                                            .primary
+                                            .withValues(alpha: 0.07),
+                                        shape: RoundedRectangleBorder(
+                                          borderRadius: BorderRadius.circular(
+                                            12,
+                                          ),
+                                        ),
+                                        onTap: () =>
+                                            Navigator.of(context).pop(r.id),
+                                      );
+                                    }),
+                                    const SizedBox(height: 8),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        );
+                        if (selectedId != null &&
+                            selectedId != selected?.id &&
+                            context.mounted) {
+                          await appState.selectRouter(
+                            selectedId,
+                            context: context,
+                          );
+                        }
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.only(
+                          left: 16.0,
+                          right: 8.0,
+                          top: 4.0,
+                          bottom: 4.0,
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: [
+                            Text(
+                              headerText,
+                              style:
+                                  Theme.of(
+                                    context,
+                                  ).appBarTheme.titleTextStyle ??
+                                  Theme.of(
+                                    context,
+                                  ).textTheme.titleLarge?.copyWith(
+                                    fontWeight: FontWeight.bold,
+                                    color: Theme.of(
+                                      context,
+                                    ).appBarTheme.titleTextStyle?.color,
+                                  ),
+                              overflow: TextOverflow.ellipsis,
+                              textAlign: TextAlign.center,
+                            ),
+                            const SizedBox(width: 2),
+                            Icon(
+                              Icons.arrow_drop_down,
+                              size: 20,
+                              color: Theme.of(
+                                context,
+                              ).colorScheme.onSurfaceVariant,
+                            ),
+                          ],
                         ),
                       ),
                     ),
-                  )
-                : _buildTitleWithTimestamp(headerText, appState),
-          ),
-          body: Stack(
-            children: [
-              _buildBody(appState),
-            ],
-          ),
-        );
+                  ),
+                ),
+              )
+            : _buildTitleWithTimestamp(headerText, appState),
+      ),
+      body: Stack(children: [_buildBody(appState)]),
+    );
   }
 
   Widget _buildBody(AppState appState) {

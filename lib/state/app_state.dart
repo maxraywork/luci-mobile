@@ -1,29 +1,34 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
-import 'package:http/io_client.dart' as http;
+import 'package:dio/dio.dart';
+import 'package:dio/io.dart';
 import 'package:luci_mobile/services/secure_storage_service.dart';
 import 'package:luci_mobile/services/router_service.dart';
 import 'package:luci_mobile/services/throughput_service.dart';
+import 'package:luci_mobile/models/client.dart';
 import 'package:luci_mobile/models/router.dart' as model;
+import 'package:luci_mobile/models/dashboard_preferences.dart';
 import 'package:luci_mobile/services/interfaces/auth_service_interface.dart';
 import 'package:luci_mobile/services/interfaces/api_service_interface.dart';
+import 'package:luci_mobile/services/api_service.dart';
 import 'package:luci_mobile/services/service_factory.dart';
 import 'package:luci_mobile/config/app_config.dart';
 import 'package:luci_mobile/utils/http_client_manager.dart';
+import 'package:luci_mobile/utils/logger.dart';
 
 class AppState extends ChangeNotifier {
   static AppState? _instance;
-  
+
   late final SecureStorageService _secureStorageService;
   IApiService? _apiService;
   IAuthService? _authService;
   RouterService? _routerService;
   ThroughputService? _throughputService;
   final HttpClientManager _httpClientManager = HttpClientManager();
-  
+
   // Reviewer mode state
   bool _reviewerModeEnabled = false;
   bool get reviewerModeEnabled => _reviewerModeEnabled;
@@ -38,7 +43,8 @@ class AppState extends ChangeNotifier {
   Timer? _throughputTimer;
   Timer? _pollingTimer;
   int _pollAttempts = 0;
-  static const int _maxPollAttempts = 40; // Max 40 attempts = ~5 minutes with backoff
+  static const int _maxPollAttempts =
+      40; // Max 40 attempts = ~5 minutes with backoff
 
   // Add rebooting state
   bool _isRebooting = false;
@@ -47,6 +53,15 @@ class AppState extends ChangeNotifier {
   // Theme mode state
   ThemeMode _themeMode = ThemeMode.system;
   static const String _themeModeKey = 'themeMode';
+
+  // Clients view mode (aggregate across routers)
+  bool _clientsAggregateAllRouters = true;
+  static const String _clientsAggregateKey = 'clients_aggregate_all';
+  bool get clientsAggregateAllRouters => _clientsAggregateAllRouters;
+
+  // Dashboard preferences state
+  DashboardPreferences _dashboardPreferences = DashboardPreferences();
+  DashboardPreferences get dashboardPreferences => _dashboardPreferences;
 
   List<model.Router> get routers => _routerService?.routers ?? [];
   model.Router? get selectedRouter => _routerService?.selectedRouter;
@@ -66,31 +81,81 @@ class AppState extends ChangeNotifier {
   AppState._() {
     _initialize();
   }
-  
+
   static AppState get instance {
     return _instance ??= AppState._();
   }
-  
+
   Future<void> _initialize() async {
     await _loadReviewerMode();
     _initializeServices();
     await _loadThemeMode();
-    await loadRouters(); // Load routers on app start
+    await loadRouters(); // Load routers on app start (sets selectedRouter)
+    await _migrateGlobalDashboardPreferencesIfNeeded(); // Proactively migrate legacy prefs
+    await _loadClientsViewMode();
+    await loadDashboardPreferences(); // Load prefs scoped to selected router
   }
-  
+
+  /// One-time migration: if a global 'dashboard_preferences' exists,
+  /// copy it to each router-specific key that doesn't already have prefs.
+  Future<void> _migrateGlobalDashboardPreferencesIfNeeded() async {
+    try {
+      final globalKey = 'dashboard_preferences';
+      final globalJson = await _secureStorageService.readValue(globalKey);
+      if (globalJson == null || globalJson.isEmpty) return;
+
+      final routers = _routerService?.routers ?? const <model.Router>[];
+      if (routers.isEmpty) return;
+
+      // Validate JSON format before writing
+      try {
+        jsonDecode(globalJson);
+      } catch (_) {
+        return; // Not valid JSON; skip migration
+      }
+
+      for (final router in routers) {
+        final key = 'dashboard_preferences:${router.id}';
+        final existing = await _secureStorageService.readValue(key);
+        if (existing == null || existing.isEmpty) {
+          await _secureStorageService.writeValue(key, globalJson);
+        }
+      }
+
+      // If all routers now have scoped prefs, remove the legacy global key
+      var allHavePrefs = true;
+      for (final router in routers) {
+        final key = 'dashboard_preferences:${router.id}';
+        final v = await _secureStorageService.readValue(key);
+        if (v == null || v.isEmpty) {
+          allHavePrefs = false;
+          break;
+        }
+      }
+      if (allHavePrefs) {
+        await _secureStorageService.deleteValue(globalKey);
+      }
+    } catch (e, stack) {
+      Logger.exception('Failed migrating global dashboard preferences', e, stack);
+    }
+  }
+
   Future<void> _loadReviewerMode() async {
     // Initialize secure storage service with default factory first
     ServiceContainer.configure(reviewerMode: false);
-    _secureStorageService = ServiceContainer.instance.factory.createSecureStorageService();
-    
-    final stored = await _secureStorageService.readValue(AppConfig.reviewerModeKey);
+    _secureStorageService = ServiceContainer.instance.factory
+        .createSecureStorageService();
+
+    final stored = await _secureStorageService.readValue(
+      AppConfig.reviewerModeKey,
+    );
     _reviewerModeEnabled = stored == 'true';
   }
-  
+
   void _initializeServices() {
     // Configure the service container based on reviewer mode
     ServiceContainer.configure(reviewerMode: _reviewerModeEnabled);
-    
+
     // Create services using the factory
     final factory = ServiceContainer.instance.factory;
     _authService = factory.createAuthService();
@@ -98,10 +163,13 @@ class AppState extends ChangeNotifier {
     _routerService = factory.createRouterService();
     _throughputService = factory.createThroughputService();
   }
-  
+
   Future<void> setReviewerMode(bool enabled) async {
     _reviewerModeEnabled = enabled;
-    await _secureStorageService.writeValue(AppConfig.reviewerModeKey, enabled.toString());
+    await _secureStorageService.writeValue(
+      AppConfig.reviewerModeKey,
+      enabled.toString(),
+    );
     _initializeServices();
     notifyListeners();
   }
@@ -125,9 +193,71 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> _loadClientsViewMode() async {
+    final stored = await _secureStorageService.readValue(_clientsAggregateKey);
+    if (stored == 'true') {
+      _clientsAggregateAllRouters = true;
+    } else if (stored == 'false') {
+      _clientsAggregateAllRouters = false;
+    }
+  }
+
+  Future<void> setClientsAggregateAllRouters(bool aggregate) async {
+    _clientsAggregateAllRouters = aggregate;
+    await _secureStorageService.writeValue(
+      _clientsAggregateKey,
+      aggregate.toString(),
+    );
+    notifyListeners();
+  }
+
+  Future<void> loadDashboardPreferences() async {
+    try {
+      // Scope preferences by selected router if available
+      final routerId = _routerService?.selectedRouter?.id;
+      final key = routerId != null
+          ? 'dashboard_preferences:$routerId'
+          : 'dashboard_preferences';
+
+      // Try router-specific key first
+      String? json = await _secureStorageService.readValue(key);
+      // Backward-compat: if missing, fall back to global key
+      if ((json == null || json.isEmpty) && routerId != null) {
+        json = await _secureStorageService.readValue('dashboard_preferences');
+      }
+      if (json != null && json.isNotEmpty) {
+        _dashboardPreferences = DashboardPreferences.fromJson(jsonDecode(json));
+        notifyListeners();
+      }
+    } catch (e, stack) {
+      Logger.exception('Failed to load dashboard preferences', e, stack);
+      _dashboardPreferences = DashboardPreferences();
+    }
+  }
+
+  Future<void> saveDashboardPreferences(DashboardPreferences prefs) async {
+    try {
+      _dashboardPreferences = prefs;
+      final routerId = _routerService?.selectedRouter?.id;
+      final key = routerId != null
+          ? 'dashboard_preferences:$routerId'
+          : 'dashboard_preferences';
+      await _secureStorageService.writeValue(key, jsonEncode(prefs.toJson()));
+      notifyListeners();
+    } catch (e, stack) {
+      Logger.exception('Failed to save dashboard preferences', e, stack);
+      rethrow;
+    }
+  }
+
   String? get sysauth => _authService?.sysauth;
   bool get isLoading => _isLoading;
   String? get errorMessage => _errorMessage;
+
+  void setError(String error) {
+    _errorMessage = error;
+    notifyListeners();
+  }
 
   Map<String, dynamic>? get dashboardData => _dashboardData;
   List<double> get rxHistory => _throughputService?.rxHistory ?? [];
@@ -136,6 +266,27 @@ class AppState extends ChangeNotifier {
   double get currentTxRate => _throughputService?.currentTxRate ?? 0.0;
   bool get isDashboardLoading => _isDashboardLoading;
   String? get dashboardError => _dashboardError;
+
+  // Interface-specific throughput getters
+  List<double> getRxHistoryForInterface(String interface) {
+    final deviceName = _getDeviceNameForInterface(interface);
+    return _throughputService?.getRxHistoryForInterface(deviceName ?? interface) ?? [];
+  }
+
+  List<double> getTxHistoryForInterface(String interface) {
+    final deviceName = _getDeviceNameForInterface(interface);
+    return _throughputService?.getTxHistoryForInterface(deviceName ?? interface) ?? [];
+  }
+
+  double getCurrentRxRateForInterface(String interface) {
+    final deviceName = _getDeviceNameForInterface(interface);
+    return _throughputService?.getCurrentRxRateForInterface(deviceName ?? interface) ?? 0.0;
+  }
+
+  double getCurrentTxRateForInterface(String interface) {
+    final deviceName = _getDeviceNameForInterface(interface);
+    return _throughputService?.getCurrentTxRateForInterface(deviceName ?? interface) ?? 0.0;
+  }
 
   Future<void> loadRouters() async {
     await _routerService?.loadRouters();
@@ -149,13 +300,16 @@ class AppState extends ChangeNotifier {
 
   Future<void> removeRouter(String id) async {
     if (_routerService == null) return;
-    
+
     // Get the router before removing to clear its certificates
-    final router = _routerService!.routers.firstWhere((r) => r.id == id, orElse: () => throw Exception('Router not found'));
-    
+    final router = _routerService!.routers.firstWhere(
+      (r) => r.id == id,
+      orElse: () => throw Exception('Router not found'),
+    );
+
     // Clear certificates for this specific router
     await _httpClientManager.clearCertificatesForHost(router.ipAddress);
-    
+
     final needsSwitch = await _routerService!.removeRouter(id);
     if (needsSwitch && _routerService!.routers.isNotEmpty) {
       await selectRouter(_routerService!.routers.first.id);
@@ -169,24 +323,31 @@ class AppState extends ChangeNotifier {
 
   Future<void> selectRouter(String id, {BuildContext? context}) async {
     if (_routerService == null || _routerService!.routers.isEmpty) return;
-    
+
     final found = _routerService!.selectRouter(id);
     if (found == null) return;
-    
+
     _isLoading = true;
     _dashboardError = null;
 
     // Clear throughput data when switching routers to prevent mixing data from different routers
     _cancelThroughputTimer();
 
+    // Determine a safe context before any awaits
+    final safeContext = context?.mounted == true ? context : null; // ignore: use_build_context_synchronously
+
+    // Load router-scoped dashboard preferences immediately on selection
+    await loadDashboardPreferences();
+
     notifyListeners();
+    // ignore: use_build_context_synchronously
     final loginSuccess = await login(
       found.ipAddress,
       found.username,
       found.password,
       found.useHttps,
       fromRouter: true,
-      context: context,
+      context: safeContext, // ignore: use_build_context_synchronously
     );
     if (loginSuccess) {
       await fetchDashboardData();
@@ -218,19 +379,39 @@ class AppState extends ChangeNotifier {
 
     try {
       await _authService!.login(ip, user, pass, useHttps, context: context);
-      
+
       // Check if authentication was successful
       if (_authService!.isAuthenticated) {
+        // Get the actual protocol used (might be different due to redirect)
+        final actualUseHttps = _authService!.useHttps;
+
         if (!fromRouter) {
-          // If not from router selection, add or update router
+          // If not from router selection, add or update router with detected protocol
           if (_routerService != null) {
-            final router = _routerService!.createRouter(ip, user, pass, useHttps);
-            final idx = _routerService!.routers.indexWhere((r) => r.id == router.id);
+            final router = _routerService!.createRouter(
+              ip,
+              user,
+              pass,
+              actualUseHttps, // Use the detected protocol
+            );
+            final idx = _routerService!.routers.indexWhere(
+              (r) => r.id == router.id,
+            );
             if (idx == -1) {
               await addRouter(router);
             } else {
               await updateRouter(router);
             }
+          }
+        } else if (actualUseHttps != useHttps && _routerService != null) {
+          // If we're logging in from a saved router and the protocol changed, update it
+          final router = _routerService!.selectedRouter;
+          if (router != null) {
+            final updatedRouter = router.copyWith(useHttps: actualUseHttps);
+            await updateRouter(updatedRouter);
+            Logger.info(
+              'Updated router protocol from ${useHttps ? "HTTPS" : "HTTP"} to ${actualUseHttps ? "HTTPS" : "HTTP"}',
+            );
           }
         }
         await fetchDashboardData();
@@ -268,9 +449,11 @@ class AppState extends ChangeNotifier {
       _isDashboardLoading = true;
       _dashboardError = null;
       notifyListeners();
-      
-      await Future.delayed(const Duration(milliseconds: 500)); // Simulate network delay
-      
+
+      await Future.delayed(
+        const Duration(milliseconds: 500),
+      ); // Simulate network delay
+
       try {
         final results = await Future.wait([
           _apiService!.callSimple('system', 'board', {}),
@@ -281,11 +464,11 @@ class AppState extends ChangeNotifier {
           _apiService!.callSimple('luci-rpc', 'getDHCPLeases', {}),
           _apiService!.callSimple('uci', 'get', {'config': 'wireless'}),
         ]);
-        
+
         final interfaceDump = results[3][1] as Map<String, dynamic>;
         final rawDhcpData = results[5][1] as Map<String, dynamic>;
         final processedDhcpData = _processDhcpLeases(rawDhcpData);
-        
+
         _dashboardData = {
           'boardInfo': results[0][1],
           'sysInfo': results[1][1],
@@ -296,24 +479,43 @@ class AppState extends ChangeNotifier {
           'uciWirelessConfig': results[6][1],
           'wan': _extractWanData(interfaceDump),
           'wireguard': <String, dynamic>{}, // Empty for reviewer mode
-          '_lastUpdated': DateTime.now().millisecondsSinceEpoch, // Force UI updates
+          '_lastUpdated':
+              DateTime.now().millisecondsSinceEpoch, // Force UI updates
         };
-        
+
         // Update throughput data with mock network data for reviewer mode
         if (_throughputService != null) {
           final networkData = results[2][1] as Map<String, dynamic>?;
-          final wanDeviceNames = {'eth0'}; // Mock WAN device
-          _throughputService!.updateThroughput(networkData, wanDeviceNames);
+          final wanDeviceNames = {
+            'eth0',
+            'wlan0',
+            'br-lan',
+          }; // Mock all devices
+
+        // Check if we should track specific interface
+        final prefs = _dashboardPreferences;
+        String? specificInterface;
+        if (!prefs.showAllThroughput &&
+            prefs.primaryThroughputInterface != null) {
+          // Map interface name to actual device name
+          specificInterface = _getDeviceNameForInterface(prefs.primaryThroughputInterface!);
         }
-        
+
+          _throughputService!.updateThroughput(
+            networkData,
+            wanDeviceNames,
+            specificInterface: specificInterface,
+          );
+        }
+
         // Start throughput timer for reviewer mode
         _startThroughputTimer();
-        
+
         // Schedule an immediate throughput update to get initial data faster
         Future.delayed(const Duration(milliseconds: 100), () {
           _updateThroughputOnly();
         });
-        
+
         _isDashboardLoading = false;
         notifyListeners();
       } catch (e) {
@@ -323,11 +525,12 @@ class AppState extends ChangeNotifier {
       }
       return;
     }
-    
-    if (_routerService?.selectedRouter == null || _authService?.sysauth == null) {
+
+    if (_routerService?.selectedRouter == null ||
+        _authService?.sysauth == null) {
       return;
     }
-    
+
     // If already loading, don't start another request (but this shouldn't prevent pull-to-refresh)
     // We'll let the new request proceed and the loading state will be handled properly
     final ip = _routerService!.selectedRouter!.ipAddress;
@@ -465,19 +668,21 @@ class AppState extends ChangeNotifier {
         }
       }
 
-      // Throughput calculation
+      // Throughput calculation - collect ALL interface devices
       final wanDeviceNames = <String>{};
       if (interfaceDump != null && interfaceDump['interface'] is List) {
         for (final interface in interfaceDump['interface']) {
           if (interface is Map<String, dynamic>) {
             final ifname = interface['interface'] as String?;
-            final proto = interface['proto'] as String?;
-            // Identify WAN interfaces by name convention or protocol
-            if (ifname != null &&
-                (ifname.startsWith('wan') || proto == 'pppoe')) {
+            // Skip only loopback interface
+            if (ifname != null && ifname != 'loopback' && ifname != 'lo') {
               final device = interface['device'] as String?;
+              final l3Device = interface['l3_device'] as String?;
               if (device != null) {
                 wanDeviceNames.add(device);
+              }
+              if (l3Device != null && l3Device != device) {
+                wanDeviceNames.add(l3Device);
               }
             }
           }
@@ -485,7 +690,20 @@ class AppState extends ChangeNotifier {
       }
 
       // Update throughput data using the service
-      _throughputService?.updateThroughput(networkData, wanDeviceNames);
+        // Check if we should track specific interface
+        final prefs = _dashboardPreferences;
+        String? specificInterface;
+        if (!prefs.showAllThroughput &&
+            prefs.primaryThroughputInterface != null) {
+          // Map interface name to actual device name
+          specificInterface = _getDeviceNameForInterface(prefs.primaryThroughputInterface!);
+        }
+
+      _throughputService?.updateThroughput(
+        networkData,
+        wanDeviceNames,
+        specificInterface: specificInterface,
+      );
 
       _dashboardData = {
         'boardInfo': getData(results[0]),
@@ -497,7 +715,8 @@ class AppState extends ChangeNotifier {
         'wan': _extractWanData(interfaceDump),
         'uciWirelessConfig': uciWirelessConfig,
         'wireguard': wireguardData,
-        '_lastUpdated': DateTime.now().millisecondsSinceEpoch, // Force UI updates
+        '_lastUpdated':
+            DateTime.now().millisecondsSinceEpoch, // Force UI updates
       };
 
       // Hybrid approach: update lastKnownHostname for the selected router
@@ -506,15 +725,14 @@ class AppState extends ChangeNotifier {
       if (hostname != null && hostname.isNotEmpty) {
         await _routerService?.updateSelectedRouterHostname(hostname);
       }
-      
+
       // Ensure throughput timer is running
       _startThroughputTimer();
-      
+
       // Schedule an immediate throughput update to get initial data faster
       Future.delayed(const Duration(milliseconds: 100), () {
         _updateThroughputOnly();
       });
-      
     } catch (e) {
       final errorMessage = e.toString();
       if (errorMessage.contains('Access denied')) {
@@ -535,10 +753,10 @@ class AppState extends ChangeNotifier {
   Map<String, dynamic> _processDhcpLeases(Map<String, dynamic> rawDhcpData) {
     final stdout = rawDhcpData['stdout'] as String? ?? '';
     final leases = <Map<String, dynamic>>[];
-    
+
     for (final line in stdout.split('\n')) {
       if (line.trim().isEmpty) continue;
-      
+
       final parts = line.trim().split(' ');
       if (parts.length >= 5) {
         // Format: timestamp mac_address ip_address hostname client_id
@@ -546,7 +764,7 @@ class AppState extends ChangeNotifier {
         final macAddress = parts[1];
         final ipAddress = parts[2];
         final hostname = parts[3];
-        
+
         leases.add({
           'expires': timestamp,
           'macaddr': macAddress,
@@ -557,10 +775,8 @@ class AppState extends ChangeNotifier {
         });
       }
     }
-    
-    return {
-      'dhcp_leases': leases,
-    };
+
+    return {'dhcp_leases': leases};
   }
 
   Map<String, dynamic>? _extractWanData(Map<String, dynamic>? interfaceDump) {
@@ -586,6 +802,31 @@ class AppState extends ChangeNotifier {
     return null;
   }
 
+  String? _getDeviceNameForInterface(String interfaceName) {
+    // Handle wireless format: "SSID (deviceName)"
+    if (interfaceName.contains('(')) {
+      final match = RegExp(r'\(([^)]+)\)').firstMatch(interfaceName);
+      return match?.group(1);
+    }
+    
+    // Map interface names to their actual device names from interface dump
+    final interfaceDump = _dashboardData?['interfaceDump'] as Map<String, dynamic>?;
+    if (interfaceDump != null && interfaceDump['interface'] is List) {
+      for (final interface in interfaceDump['interface']) {
+        if (interface is Map<String, dynamic>) {
+          final ifname = interface['interface'] as String?;
+          if (ifname == interfaceName) {
+            // Return the device or l3_device field
+            return (interface['device'] ?? interface['l3_device']) as String?;
+          }
+        }
+      }
+    }
+    
+    // If not found in interface dump, check if it's already a device name
+    // (e.g., eth0, br-lan, wlan0)
+    return interfaceName;
+  }
 
   void _startThroughputTimer() {
     _throughputTimer?.cancel();
@@ -604,14 +845,36 @@ class AppState extends ChangeNotifier {
     if (_isRebooting) {
       return;
     }
-    
+
     if (_reviewerModeEnabled) {
       // For reviewer mode, get network devices data only
       try {
         final result = await _apiService!.callSimple('network', 'device', {});
         final networkData = result[1] as Map<String, dynamic>?;
         final wanDeviceNames = {'eth0'}; // Mock WAN device
-        _throughputService?.updateThroughput(networkData, wanDeviceNames);
+
+        // Check if we should track specific interface
+        final prefs = _dashboardPreferences;
+        String? specificInterface;
+        if (!prefs.showAllThroughput &&
+            prefs.primaryThroughputInterface != null) {
+          // Extract device name from interface ID (format: "SSID (deviceName)" or just "deviceName")
+          final interfaceId = prefs.primaryThroughputInterface!;
+          if (interfaceId.contains('(')) {
+            // Wireless format: "SSID (deviceName)"
+            final match = RegExp(r'\(([^)]+)\)').firstMatch(interfaceId);
+            specificInterface = match?.group(1);
+          } else {
+            // Wired format: just device name
+            specificInterface = interfaceId;
+          }
+        }
+
+        _throughputService?.updateThroughput(
+          networkData,
+          wanDeviceNames,
+          specificInterface: specificInterface,
+        );
         notifyListeners();
       } catch (e) {
         // Don't log throughput update errors as they're non-critical
@@ -619,7 +882,8 @@ class AppState extends ChangeNotifier {
       return;
     }
 
-    if (_routerService?.selectedRouter == null || _authService?.sysauth == null) {
+    if (_routerService?.selectedRouter == null ||
+        _authService?.sysauth == null) {
       return;
     }
 
@@ -639,27 +903,50 @@ class AppState extends ChangeNotifier {
 
       if (result is List && result.length > 1 && result[0] == 0) {
         final networkData = result[1] as Map<String, dynamic>?;
-        
-        // Get WAN device names from cached dashboard data
+
+        // Get ALL device names from cached dashboard data (except loopback)
         final wanDeviceNames = <String>{};
-        final interfaceDump = _dashboardData?['interfaceDump'] as Map<String, dynamic>?;
+        final interfaceDump =
+            _dashboardData?['interfaceDump'] as Map<String, dynamic>?;
         if (interfaceDump != null && interfaceDump['interface'] is List) {
           for (final interface in interfaceDump['interface']) {
             if (interface is Map<String, dynamic>) {
               final ifname = interface['interface'] as String?;
-              final proto = interface['proto'] as String?;
-              if (ifname != null &&
-                  (ifname.startsWith('wan') || proto == 'pppoe')) {
-                final device = interface['device'] as String?;
-                if (device != null) {
-                  wanDeviceNames.add(device);
+              final device = interface['device'] as String?;
+              final l3Device = interface['l3_device'] as String?;
+              // Include all interfaces except loopback
+              if (ifname != null && ifname != 'loopback' && ifname != 'lo') {
+                if (device != null) wanDeviceNames.add(device);
+                if (l3Device != null && l3Device != device) {
+                  wanDeviceNames.add(l3Device);
                 }
               }
             }
           }
         }
 
-        _throughputService?.updateThroughput(networkData, wanDeviceNames);
+        // Check if we should track specific interface
+        final prefs = _dashboardPreferences;
+        String? specificInterface;
+        if (!prefs.showAllThroughput &&
+            prefs.primaryThroughputInterface != null) {
+          // Extract device name from interface ID (format: "SSID (deviceName)" or just "deviceName")
+          final interfaceId = prefs.primaryThroughputInterface!;
+          if (interfaceId.contains('(')) {
+            // Wireless format: "SSID (deviceName)"
+            final match = RegExp(r'\(([^)]+)\)').firstMatch(interfaceId);
+            specificInterface = match?.group(1);
+          } else {
+            // Wired format: just device name
+            specificInterface = interfaceId;
+          }
+        }
+
+        _throughputService?.updateThroughput(
+          networkData,
+          wanDeviceNames,
+          specificInterface: specificInterface,
+        );
         notifyListeners();
       }
     } catch (e) {
@@ -673,11 +960,13 @@ class AppState extends ChangeNotifier {
   }
 
   Future<bool> reboot({BuildContext? context}) async {
-    if (_authService?.sysauth == null || _authService?.ipAddress == null) return false;
+    if (_authService?.sysauth == null || _authService?.ipAddress == null) {
+      return false;
+    }
 
     // Cancel throughput timer before starting reboot to prevent "client closed" errors
     _cancelThroughputTimer();
-    
+
     _isRebooting = true;
     notifyListeners();
 
@@ -705,18 +994,18 @@ class AppState extends ChangeNotifier {
     // Reset poll attempts
     _pollAttempts = 0;
     _pollingTimer?.cancel();
-    
+
     // Start polling with exponential backoff
     _scheduleNextPoll();
   }
-  
+
   void _scheduleNextPoll() {
     if (_pollAttempts >= _maxPollAttempts) {
       // Max attempts reached, stop polling
       _isRebooting = false;
       notifyListeners();
       // print('[Reboot] Timeout: Router did not come back online after $_maxPollAttempts attempts');
-      
+
       // Show a user-friendly message
       if (onRouterBackOnline != null) {
         // Reuse the callback to show timeout message
@@ -724,7 +1013,7 @@ class AppState extends ChangeNotifier {
       }
       return;
     }
-    
+
     // Calculate delay with exponential backoff: 3s, 3s, 5s, 8s, 12s, 18s, then 20s intervals
     int delaySeconds;
     if (_pollAttempts < 2) {
@@ -740,11 +1029,11 @@ class AppState extends ChangeNotifier {
     } else {
       delaySeconds = 20; // Cap at 20 seconds for remaining attempts
     }
-    
+
     _pollingTimer = Timer(Duration(seconds: delaySeconds), () async {
       _pollAttempts++;
       final available = await _pingRouter();
-      
+
       if (available) {
         // Router is back online
         _pollingTimer?.cancel();
@@ -752,12 +1041,12 @@ class AppState extends ChangeNotifier {
         _isRebooting = false;
         _pollAttempts = 0;
         notifyListeners();
-        
+
         // Notify UI that router is back online
         if (onRouterBackOnline != null) {
           onRouterBackOnline!();
         }
-        
+
         // Force relogin
         if (_routerService?.selectedRouter != null) {
           await login(
@@ -776,65 +1065,73 @@ class AppState extends ChangeNotifier {
 
   Future<bool> _pingRouter() async {
     if (_authService?.ipAddress == null) return false;
-    
+
     // Clear cached HTTP clients for this host to avoid stale connections
     if (_pollAttempts == 0) {
-      _httpClientManager.disposeClient(_authService!.ipAddress!, _authService!.useHttps);
+      _httpClientManager.disposeClient(
+        _authService!.ipAddress!,
+        _authService!.useHttps,
+      );
     }
-    
+
     // Try multiple endpoints in order
     final scheme = _authService!.useHttps ? 'https' : 'http';
     final endpoints = [
-      '/',  // Root
-      '/cgi-bin/luci/',  // LuCI login page
-      '/cgi-bin/luci/admin',  // Admin page
+      '/', // Root
+      '/cgi-bin/luci/', // LuCI login page
+      '/cgi-bin/luci/admin', // Admin page
     ];
-    
+
     for (final endpoint in endpoints) {
       try {
-        final uri = Uri.parse('$scheme://${_authService!.ipAddress}$endpoint');
-        
-        // Create a fresh HTTP client for pinging to avoid certificate/connection issues
-        http.Client client;
+        final url = '$scheme://${_authService!.ipAddress}$endpoint';
+
+        // Create a fresh Dio client for pinging to avoid certificate/connection issues
+        final dio = Dio(
+          BaseOptions(
+            connectTimeout: const Duration(seconds: 5),
+            receiveTimeout: const Duration(seconds: 5),
+            sendTimeout: const Duration(seconds: 5),
+            followRedirects: false,
+            validateStatus: (code) => code != null && code >= 200 && code < 500,
+          ),
+        );
+
         if (_authService!.useHttps) {
-          // For HTTPS, create a client that accepts any certificate during ping
-          final httpClient = HttpClient();
-          httpClient.connectionTimeout = const Duration(seconds: 5);
-          httpClient.badCertificateCallback = (cert, host, port) => true; // Accept any cert for ping
-          client = http.IOClient(httpClient);
-        } else {
-          client = http.Client();
+          final adapter = IOHttpClientAdapter();
+          adapter.createHttpClient = () {
+            final httpClient = HttpClient();
+            httpClient.connectionTimeout = const Duration(seconds: 5);
+            // Accept any cert for ping only
+            httpClient.badCertificateCallback = (cert, host, port) => true;
+            return httpClient;
+          };
+          dio.httpClientAdapter = adapter;
         }
-        
-        try {
-          // print('[Ping] Attempt $_pollAttempts: Checking $uri');
-          final response = await client
-              .get(uri)
-              .timeout(const Duration(seconds: 5));
-          
-          // print('[Ping] Response from $endpoint: ${response.statusCode}');
-          
-          // Accept various status codes as "alive"
-          final isAlive = response.statusCode >= 200 && response.statusCode < 500;
-          
-          if (isAlive) {
-            if (_pollAttempts > 5) {
-              // If we've been polling for a while and get a response,
-              // wait a bit more to ensure services are fully started
-              // print('[Ping] Router appears online, waiting for services to stabilize...');
-              await Future.delayed(const Duration(seconds: 5));
-            }
-            return true;
+
+        // print('[Ping] Attempt $_pollAttempts: Checking $url');
+        final response = await dio.get(url);
+        // print('[Ping] Response from $endpoint: ${response.statusCode}');
+
+        // Accept various status codes as "alive"
+        final isAlive = response.statusCode != null &&
+            response.statusCode! >= 200 &&
+            response.statusCode! < 500;
+
+        if (isAlive) {
+          if (_pollAttempts > 5) {
+            // If we've been polling for a while and get a response,
+            // wait a bit more to ensure services are fully started
+            await Future.delayed(const Duration(seconds: 5));
           }
-        } finally {
-          client.close();
+          return true;
         }
       } catch (e) {
         // Try next endpoint
         if (endpoint == endpoints.last) {
           // print('[Ping] All endpoints failed on attempt $_pollAttempts');
           // print('[Ping] Last error: ${e.toString()}');
-          
+
           if (e is SocketException) {
             // print('[Ping] Socket error: ${e.message}, OS Error: ${e.osError}');
           } else if (e is HandshakeException) {
@@ -843,7 +1140,7 @@ class AppState extends ChangeNotifier {
         }
       }
     }
-    
+
     return false;
   }
 
@@ -851,18 +1148,27 @@ class AppState extends ChangeNotifier {
     if (_reviewerModeEnabled || _authService?.ipAddress == null) {
       return _reviewerModeEnabled;
     }
-    return await _authService!.checkRouterAvailability(_authService!.ipAddress!, _authService!.useHttps);
+    return await _authService!.checkRouterAvailability(
+      _authService!.ipAddress!,
+      _authService!.useHttps,
+    );
   }
 
-  Future<bool> setWirelessRadioState(String device, bool enabled, {BuildContext? context}) async {
+  Future<bool> setWirelessRadioState(
+    String device,
+    bool enabled, {
+    BuildContext? context,
+  }) async {
     if (_reviewerModeEnabled) {
       // Simulate operation for reviewer mode
       await Future.delayed(const Duration(milliseconds: 500));
       await fetchDashboardData();
       return true;
     }
-    
-    if (_authService?.sysauth == null || _authService?.ipAddress == null) return false;
+
+    if (_authService?.sysauth == null || _authService?.ipAddress == null) {
+      return false;
+    }
 
     try {
       // 1. Set the disabled state
@@ -907,9 +1213,22 @@ class AppState extends ChangeNotifier {
 
   Future<bool> tryAutoLogin({BuildContext? context}) async {
     if (_reviewerModeEnabled) {
-      return await _authService!.tryAutoLogin(null, null, null, null, context: context);
+      return await _authService!.tryAutoLogin(
+        null,
+        null,
+        null,
+        null,
+        context: context,
+      );
     }
-    return await _authService?.tryAutoLogin(null, null, null, null, context: context) ?? false;
+    return await _authService?.tryAutoLogin(
+          null,
+          null,
+          null,
+          null,
+          context: context,
+        ) ??
+        false;
   }
 
   /// Fetch all associated wireless MAC addresses from all wireless interfaces
@@ -924,18 +1243,20 @@ class AppState extends ChangeNotifier {
       return macs;
     } else {
       // Use the context-aware method for real API calls
-      if (_routerService?.selectedRouter == null || _authService?.sysauth == null) {
+      if (_routerService?.selectedRouter == null ||
+          _authService?.sysauth == null) {
         return {};
       }
-      
+
       final ip = _routerService!.selectedRouter!.ipAddress;
       final useHttps = _routerService!.selectedRouter!.useHttps;
-      
-      final stationsMap = await _apiService!.fetchAllAssociatedWirelessMacsWithContext(
-        ipAddress: ip,
-        sysauth: _authService!.sysauth!,
-        useHttps: useHttps,
-      );
+
+      final stationsMap = await _apiService!
+          .fetchAllAssociatedWirelessMacsWithContext(
+            ipAddress: ip,
+            sysauth: _authService!.sysauth!,
+            useHttps: useHttps,
+          );
       final macs = <String>{};
       stationsMap.forEach((_, stations) {
         macs.addAll(stations.map((m) => m.toLowerCase()));
@@ -951,5 +1272,281 @@ class AppState extends ChangeNotifier {
     _pollAttempts = 0;
     _isRebooting = false;
     super.dispose();
+  }
+
+  /// Aggregates DHCP leases across all configured routers and classifies clients
+  /// as wireless if their MAC appears in any router's associated stations list.
+  Future<List<Client>> fetchAggregatedClients() async {
+    try {
+      // Build a union of wireless MACs across all routers
+      final wirelessMacs = await fetchAllAssociatedWirelessMacsAggregated();
+      final normalizedWireless = wirelessMacs
+          .map((m) => m.toUpperCase().replaceAll('-', ':'))
+          .toSet();
+
+      // Aggregate leases across routers
+      final leases = await fetchAggregatedDhcpLeases();
+
+      // Convert to Client models with connection type
+      final clients = <String, Client>{}; // key by normalized MAC
+      for (final lease in leases) {
+        final client = Client.fromLease(lease);
+        final macNorm = client.macAddress.toUpperCase().replaceAll('-', ':');
+        final isWireless = normalizedWireless.contains(macNorm);
+        final enriched = client.copyWith(
+          connectionType:
+              isWireless ? ConnectionType.wireless : ConnectionType.wired,
+        );
+        // Prefer entries that have more info (hostname length as heuristic)
+        if (!clients.containsKey(macNorm) ||
+            (enriched.hostname.isNotEmpty &&
+                enriched.hostname.length >
+                    (clients[macNorm]?.hostname.length ?? 0))) {
+          clients[macNorm] = enriched;
+        }
+      }
+
+      // Sort: wireless > wired > unknown, then by hostname
+      final list = clients.values.toList();
+      list.sort((a, b) {
+        int typeOrder(ConnectionType t) {
+          switch (t) {
+            case ConnectionType.wireless:
+              return 0;
+            case ConnectionType.wired:
+              return 1;
+            default:
+              return 2;
+          }
+        }
+
+        final cmpType =
+            typeOrder(a.connectionType).compareTo(typeOrder(b.connectionType));
+        if (cmpType != 0) return cmpType;
+        return a.hostname.toLowerCase().compareTo(b.hostname.toLowerCase());
+      });
+      return list;
+    } catch (e, stack) {
+      Logger.exception('Failed to aggregate clients', e, stack);
+      return [];
+    }
+  }
+
+  /// Returns clients for the currently selected router only
+  Future<List<Client>> fetchClientsForSelectedRouter() async {
+    try {
+      if (_reviewerModeEnabled) {
+        final stationsMap = await _apiService!.fetchAssociatedStations();
+        final macs = <String>{};
+        stationsMap.forEach((_, stations) {
+          macs.addAll(stations.map((m) => m.toLowerCase()));
+        });
+        final result = await _apiService!.callSimple(
+          'luci-rpc',
+          'getDHCPLeases',
+          {},
+        );
+        final leases = <Map<String, dynamic>>[];
+        if (result is List && result.length > 1 && result[0] == 0) {
+          final data = result[1] as Map<String, dynamic>;
+          leases.addAll(
+            (data['dhcp_leases'] as List<dynamic>? ?? [])
+                .cast<Map<String, dynamic>>(),
+          );
+        }
+        return leases.map((l) {
+          final c = Client.fromLease(l);
+          final isWireless = macs.contains(c.macAddress.toLowerCase());
+          return c.copyWith(
+            connectionType:
+                isWireless ? ConnectionType.wireless : ConnectionType.wired,
+          );
+        }).toList();
+      }
+
+      if (_routerService?.selectedRouter == null || _authService?.sysauth == null) {
+        return [];
+      }
+      final router = _routerService!.selectedRouter!;
+
+      // Get wireless MACs for this router
+      final stationsMap = await _apiService!.fetchAllAssociatedWirelessMacsWithContext(
+        ipAddress: router.ipAddress,
+        sysauth: _authService!.sysauth!,
+        useHttps: router.useHttps,
+      );
+      final wireless = <String>{};
+      stationsMap.forEach((_, s) => wireless.addAll(s.map((m) => m.toLowerCase())));
+
+      // Get DHCP leases for this router
+      final callRes = await _apiService!.call(
+        router.ipAddress,
+        _authService!.sysauth!,
+        router.useHttps,
+        object: 'luci-rpc',
+        method: 'getDHCPLeases',
+        params: {},
+      );
+      final leases = <Map<String, dynamic>>[];
+      if (callRes is List && callRes.length > 1 && callRes[0] == 0) {
+        final data = callRes[1] as Map<String, dynamic>;
+        leases.addAll(
+          (data['dhcp_leases'] as List<dynamic>? ?? [])
+              .cast<Map<String, dynamic>>(),
+        );
+      }
+
+      final clients = leases.map((l) {
+        final c = Client.fromLease(l);
+        final isWireless = wireless.contains(c.macAddress.toLowerCase());
+        return c.copyWith(
+          connectionType: isWireless ? ConnectionType.wireless : ConnectionType.wired,
+        );
+      }).toList();
+
+      // Sort similar to aggregated
+      clients.sort((a, b) {
+        int typeOrder(ConnectionType t) {
+          switch (t) {
+            case ConnectionType.wireless:
+              return 0;
+            case ConnectionType.wired:
+              return 1;
+            default:
+              return 2;
+          }
+        }
+
+        final cmpType =
+            typeOrder(a.connectionType).compareTo(typeOrder(b.connectionType));
+        if (cmpType != 0) return cmpType;
+        return a.hostname.toLowerCase().compareTo(b.hostname.toLowerCase());
+      });
+      return clients;
+    } catch (e, stack) {
+      Logger.exception('Failed to fetch clients for selected router', e, stack);
+      return [];
+    }
+  }
+
+  /// Returns a union set of associated wireless MAC addresses across all routers
+  Future<Set<String>> fetchAllAssociatedWirelessMacsAggregated() async {
+    try {
+      if (_reviewerModeEnabled) {
+        final stationsMap = await _apiService!.fetchAssociatedStations();
+        final macs = <String>{};
+        stationsMap.forEach((_, stations) {
+          macs.addAll(stations.map((m) => m.toLowerCase()));
+        });
+        return macs;
+      }
+
+      final routers = _routerService?.routers ?? const <model.Router>[];
+      if (routers.isEmpty) return {};
+
+      final tasks = routers.map((r) async {
+        try {
+          if (_apiService is RealApiService) {
+            final real = _apiService as RealApiService;
+            final res = await real.loginWithProtocolDetection(
+              r.ipAddress,
+              r.username,
+              r.password,
+              r.useHttps,
+            );
+            if (res.token == null) return <String>{};
+            final map = await _apiService!.fetchAllAssociatedWirelessMacsWithContext(
+              ipAddress: r.ipAddress,
+              sysauth: res.token!,
+              useHttps: res.actualUseHttps,
+            );
+            final set = <String>{};
+            map.forEach((_, stations) {
+              set.addAll(stations.map((m) => m.toLowerCase()));
+            });
+            return set;
+          }
+        } catch (e) {
+          // Skip router on failure
+        }
+        return <String>{};
+      }).toList();
+
+      final results = await Future.wait(tasks);
+      return results.fold<Set<String>>(<String>{}, (acc, s) => acc..addAll(s));
+    } catch (e, stack) {
+      Logger.exception('Failed to aggregate wireless MACs', e, stack);
+      return {};
+    }
+  }
+
+  /// Returns a combined list of DHCP lease maps from all routers
+  Future<List<Map<String, dynamic>>> fetchAggregatedDhcpLeases() async {
+    try {
+      if (_reviewerModeEnabled) {
+        // Use mock data
+        final result = await _apiService!.callSimple('luci-rpc', 'getDHCPLeases', {});
+        if (result is List && result.length > 1 && result[0] == 0) {
+          final data = result[1] as Map<String, dynamic>;
+          final leases = (data['dhcp_leases'] as List<dynamic>? ?? [])
+              .cast<Map<String, dynamic>>();
+          return leases;
+        }
+        return [];
+      }
+
+      final routers = _routerService?.routers ?? const <model.Router>[];
+      if (routers.isEmpty) return [];
+
+      final tasks = routers.map((r) async {
+        try {
+          if (_apiService is RealApiService) {
+            final real = _apiService as RealApiService;
+            final res = await real.loginWithProtocolDetection(
+              r.ipAddress,
+              r.username,
+              r.password,
+              r.useHttps,
+            );
+            if (res.token == null) return <Map<String, dynamic>>[];
+            final callRes = await _apiService!.call(
+              r.ipAddress,
+              res.token!,
+              res.actualUseHttps,
+              object: 'luci-rpc',
+              method: 'getDHCPLeases',
+              params: {},
+            );
+            if (callRes is List && callRes.length > 1 && callRes[0] == 0) {
+              final data = callRes[1] as Map<String, dynamic>;
+              final leases = (data['dhcp_leases'] as List<dynamic>? ?? [])
+                  .cast<Map<String, dynamic>>();
+              return leases;
+            }
+          }
+        } catch (e) {
+          // Skip router on failure
+        }
+        return <Map<String, dynamic>>[];
+      }).toList();
+
+      final results = await Future.wait(tasks);
+      // Deduplicate by MAC + IP
+      final seen = <String, Map<String, dynamic>>{};
+      for (final list in results) {
+        for (final lease in list) {
+          final mac = (lease['macaddr']?.toString() ?? '').toUpperCase();
+          final ip = lease['ipaddr']?.toString() ?? '';
+          final key = '$mac|$ip';
+          if (!seen.containsKey(key)) {
+            seen[key] = lease;
+          }
+        }
+      }
+      return seen.values.toList();
+    } catch (e, stack) {
+      Logger.exception('Failed to aggregate DHCP leases', e, stack);
+      return [];
+    }
   }
 }

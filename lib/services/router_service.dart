@@ -3,7 +3,7 @@ import 'package:luci_mobile/services/secure_storage_service.dart';
 
 class RouterService {
   final SecureStorageService _secureStorageService = SecureStorageService();
-  
+
   List<model.Router> _routers = [];
   model.Router? _selectedRouter;
 
@@ -12,28 +12,49 @@ class RouterService {
 
   Future<void> loadRouters() async {
     _routers = await _secureStorageService.getRouters();
-    if (_routers.isNotEmpty && _selectedRouter == null) {
+
+    // Try to restore the previously selected router
+    final selectedId = await _secureStorageService.getSelectedRouterId();
+    if (selectedId != null && _routers.isNotEmpty) {
+      // Try to find the router with the saved ID
+      try {
+        _selectedRouter = _routers.firstWhere((r) => r.id == selectedId);
+      } catch (e) {
+        // If not found, fall back to first router
+        _selectedRouter = _routers.first;
+      }
+    } else if (_routers.isNotEmpty && _selectedRouter == null) {
       _selectedRouter = _routers.first;
+    }
+
+    // Save the selected router ID if we have one
+    if (_selectedRouter != null) {
+      await _secureStorageService.saveSelectedRouterId(_selectedRouter!.id);
     }
   }
 
   Future<void> addRouter(model.Router router) async {
     _routers.add(router);
     await _secureStorageService.saveRouters(_routers);
-    _selectedRouter ??= router;
+    if (_selectedRouter == null) {
+      _selectedRouter = router;
+      await _secureStorageService.saveSelectedRouterId(router.id);
+    }
   }
 
   Future<bool> removeRouter(String id) async {
     final wasActive = _selectedRouter?.id == id;
     _routers.removeWhere((r) => r.id == id);
     await _secureStorageService.saveRouters(_routers);
-    
+
     if (wasActive) {
       if (_routers.isNotEmpty) {
         _selectedRouter = _routers.first;
+        await _secureStorageService.saveSelectedRouterId(_selectedRouter!.id);
         return true; // Indicates need to switch to new router
       } else {
         _selectedRouter = null;
+        await _secureStorageService.saveSelectedRouterId(null);
         return false; // No routers available
       }
     }
@@ -42,13 +63,15 @@ class RouterService {
 
   model.Router? selectRouter(String id) {
     if (_routers.isEmpty) return null;
-    
+
     final found = _routers.firstWhere(
       (r) => r.id == id,
       orElse: () => _routers.first,
     );
-    
+
     _selectedRouter = found;
+    // Save the selected router ID asynchronously
+    _secureStorageService.saveSelectedRouterId(found.id);
     return found;
   }
 
@@ -74,7 +97,12 @@ class RouterService {
     }
   }
 
-  model.Router createRouter(String ip, String user, String pass, bool useHttps) {
+  model.Router createRouter(
+    String ip,
+    String user,
+    String pass,
+    bool useHttps,
+  ) {
     final id = '$ip-$user';
     return model.Router(
       id: id,
