@@ -22,17 +22,15 @@ class ServicesScreen extends StatelessWidget {
               label: 'Podkop',
               onTap: () {
                 Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (context) => const PodkopScreen(),
-                  ),
+                  MaterialPageRoute(builder: (context) => const PodkopScreen()),
                 );
               },
             ),
             _buildMenuItem(
               context: context,
-              iconPath: 'assets/icons/podkop.svg',
+              iconPath: 'assets/icons/wireguard.svg',
               label: 'WireGuard',
-              onTap: () {},
+              isComingSoon: true,
             ),
           ],
         ),
@@ -44,14 +42,13 @@ class ServicesScreen extends StatelessWidget {
     required BuildContext context,
     required String iconPath,
     required String label,
-    required VoidCallback onTap,
+    VoidCallback? onTap,
+    bool isComingSoon = false,
   }) {
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
       elevation: 2,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(18),
-      ),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
       clipBehavior: Clip.antiAlias,
       child: InkWell(
         borderRadius: BorderRadius.circular(18),
@@ -73,6 +70,7 @@ class ServicesScreen extends StatelessWidget {
               ),
               const SizedBox(height: 8),
               Text(label),
+              if (isComingSoon) Text("Coming soon"),
             ],
           ),
         ),
